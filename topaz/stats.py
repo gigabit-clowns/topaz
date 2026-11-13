@@ -10,7 +10,7 @@ import numpy as np
 import scipy.stats
 
 import torch
-from topaz.utils.data.loader import load_image
+from topaz.utils.data.loader import read_ahead, read_with_header
 from topaz.utils.image import downsample, save_image
 
 
@@ -294,10 +294,9 @@ class Normalize:
         self.use_cuda = use_cuda
 
     def __call__(self, path):
-        # load the image
-        image = load_image(path, make_image=False)
-        # check if MRC with header and extender header 
-        (image, header, extended_header) = image if type(image) is tuple else (image, None, None)
+        return self.normalize(*read_with_header(path))
+
+    def normalize(self, path, image, header, extended_header):
         x = image.astype(np.float32)
 
         if self.scale > 1:
@@ -349,7 +348,8 @@ def normalize_images(paths:List[str], dest:str, num_workers:int, scale:int, affi
             if verbose:
                 print('# processed:', name, file=sys.stderr)
     else:
-        for path in paths:
-            name = process(path)
+        # the next images are read while one is normalized
+        for read in read_ahead(paths):
+            name = process.normalize(*read)
             if verbose:
                 print('# processed:', name, file=sys.stderr)

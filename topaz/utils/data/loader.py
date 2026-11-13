@@ -136,23 +136,25 @@ def read_mrc(path:str) -> Tuple[np.ndarray, Any, Any]:
     return image, header, extended_header
 
 
-def read_ahead(paths:Iterable[str], depth:int=2) -> Iterator[Tuple[str, np.ndarray, Any, Any]]:
-    """Read images one after another, as arrays, the next `depth` while the current
-    one is used. Yields the path, the image, and the header and extended header of an
-    MRC file, or None for them otherwise, in the order of `paths`."""
-    def read(path):
-        if os.path.splitext(path)[1] == '.mrc':
-            return (path, *read_mrc(path))
-        return path, load_image(path, make_image=False, return_header=False), None, None
+def read_with_header(path:str) -> Tuple[str, np.ndarray, Any, Any]:
+    """Read an image as an array: the path, the image, and the header and extended
+    header of an MRC file, or None for them otherwise."""
+    if os.path.splitext(path)[1] == '.mrc':
+        return (path, *read_mrc(path))
+    return path, load_image(path, make_image=False, return_header=False), None, None
 
+
+def read_ahead(paths:Iterable[str], depth:int=2) -> Iterator[Tuple[str, np.ndarray, Any, Any]]:
+    """Read images one after another as `read_with_header` does, the next `depth`
+    while the current one is used, in the order of `paths`."""
     paths = iter(paths)
     with ThreadPoolExecutor(depth) as pool:
-        pending = deque(pool.submit(read, path) for path in islice(paths, depth))
+        pending = deque(pool.submit(read_with_header, path) for path in islice(paths, depth))
         while pending:
             done = pending.popleft().result()
             following = next(paths, None)
             if following is not None:
-                pending.append(pool.submit(read, following))
+                pending.append(pool.submit(read_with_header, following))
             yield done
 
 
