@@ -687,8 +687,9 @@ def train_model(model, train_dataset, val_dataset, loss_fn:str='L2', optim:str='
     
     # prepare data
     num_workers = min(num_workers, mp.cpu_count())
-    train_data = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-    val_data = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    device = 'cuda' if use_cuda else None
+    train_data = train_dataset.make_loader(batch_size, shuffle, num_workers, device)
+    val_data = val_dataset.make_loader(batch_size, False, num_workers, device)
     
     # create loss function
     gamma = None

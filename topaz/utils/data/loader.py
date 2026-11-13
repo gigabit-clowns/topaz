@@ -2,11 +2,15 @@ from __future__ import print_function, division
 
 import os
 import glob
-from typing import Any, Dict, List, Tuple, Union
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
+from typing import Any, Dict, Iterable, Iterator, List, Tuple, Union
 
 import numpy as np
 from PIL import Image
 import torch
+import vitrio as vio
 
 import topaz.mrc as mrc
 
@@ -118,6 +122,38 @@ def load_image(path:str, standardize:bool=False, make_image:bool=True, return_he
     
     image = Image.fromarray(image) if make_image else image
     return (image,header,extended_header) if (header and return_header) else image
+
+
+def read_mrc(path:str) -> Tuple[np.ndarray, Any, Any]:
+    """Read an MRC file as `load_mrc` does: its values through vitrio, and its header
+    and extended header as Topaz parses them, since what it writes copies them."""
+    with open(path, 'rb') as f:
+        header = mrc.parse_header(f.read(1024))
+        extended_header = f.read(header.next)
+    image = np.asarray(vio.read(path))
+    if image.dtype == np.float16:
+        image = image.astype(np.float32)
+    return image, header, extended_header
+
+
+def read_ahead(paths:Iterable[str], depth:int=2) -> Iterator[Tuple[str, np.ndarray, Any, Any]]:
+    """Read images one after another, as arrays, the next `depth` while the current
+    one is used. Yields the path, the image, and the header and extended header of an
+    MRC file, or None for them otherwise, in the order of `paths`."""
+    def read(path):
+        if os.path.splitext(path)[1] == '.mrc':
+            return (path, *read_mrc(path))
+        return path, load_image(path, make_image=False, return_header=False), None, None
+
+    paths = iter(paths)
+    with ThreadPoolExecutor(depth) as pool:
+        pending = deque(pool.submit(read, path) for path in islice(paths, depth))
+        while pending:
+            done = pending.popleft().result()
+            following = next(paths, None)
+            if following is not None:
+                pending.append(pool.submit(read, following))
+            yield done
 
 
 def load_images_from_directory(names:List[str], rootdir:str, sources:List[Any]=None, standardize:bool=False, 

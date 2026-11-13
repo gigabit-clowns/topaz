@@ -14,7 +14,7 @@ from topaz.denoising.datasets import DenoiseDataset, PatchDataset
 from topaz.denoising.models import load_model, train_model
 from topaz.filters import (AffineFilter, GaussianDenoise, InvGaussianFilter,
                            gaussian_filter, inverse_filter)
-from topaz.utils.data.loader import load_image
+from topaz.utils.data.loader import load_image, read_ahead
 from topaz.utils.image import save_image
 from torch.utils.data import DataLoader
 
@@ -460,11 +460,9 @@ def denoise_stream(micrographs:List[str], output_path:str, format:str='mrc', suf
         if not os.path.exists(output_path):
             os.makedirs(output_path)
 
-    for path in micrographs:
+    # the next micrographs are read while one is denoised
+    for path, image, header, extended_header in read_ahead(micrographs):
         name,_ = os.path.splitext(os.path.basename(path))
-        image = load_image(path, make_image=False)
-        # check if MRC with header and extender header 
-        (image, header, extended_header) = image if type(image) is tuple else (image, None, None)
 
         # process and denoise the micrograph
         mic = denoise_image(image, models, lowpass=lowpass, cutoff=pixel_cutoff, gaus=gaus, 

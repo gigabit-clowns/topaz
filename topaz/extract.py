@@ -17,7 +17,7 @@ import topaz.utils.files as file_utils
 import torch
 from topaz.algorithms import match_coordinates, non_maximum_suppression, non_maximum_suppression_3d
 from topaz.metrics import average_precision
-from topaz.utils.data.loader import load_image
+from topaz.utils.data.loader import load_image, read_ahead
 from topaz.utils.printing import report
 from topaz.model.factory import load_model
 from topaz.model.utils import predict_in_patches, get_patches
@@ -231,8 +231,8 @@ def score_images(model:Union[torch.nn.Module, str], paths:Union[List[str], Itera
         if use_cuda:
             model.cuda()
         
-        for path in paths:
-            image = load_image(path, make_image=False, return_header=False)
+        # the next images are read while one is scored
+        for path, image, _, _ in read_ahead(paths):
             original_shape = image.shape
             is_3d = len(original_shape) == 3
             image = torch.from_numpy(image.copy()).float()

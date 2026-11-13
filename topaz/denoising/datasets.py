@@ -2,13 +2,19 @@ import glob
 import os
 import sys
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Union
 
 import numpy as np
 import h5py
 import torch
+import vitrio as vio
+from torch.utils.data import DataLoader
 from topaz import mrc
 from topaz.utils.data.loader import load_image
+
+# How many micrographs are read at once to normalize them.
+NORMALIZING_THREADS = 8
 
 
 class DenoiseDataset(ABC):
@@ -28,78 +34,130 @@ class DenoiseDataset(ABC):
     def __getitem__(self, i:int) -> Tuple[np.ndarray]:
         pass
 
+    def make_loader(self, batch_size:int, shuffle:bool, num_workers:int, device=None):
+        """The batches of (source, target) pairs a pass goes through, each iteration a
+        new pass. `device` is where the pairs are wanted, which they may be given on."""
+        return DataLoader(self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+
 
 class PairedImages(DenoiseDataset):
+    """Pairs of micrographs, two independent noisy views of each, such as the sums of
+    the even and of the odd frames of a movie, cropped at random to train on.
+
+    Only the crops are read, through vitrio, at new places each pass; a micrograph is
+    read whole once, for the mean and standard deviation that normalize it, and with
+    `preload` it is kept in memory as it is first read. Each batch is normalized and
+    transformed where it is handed out, on the GPU when it is trained there.
+    """
+
     def __init__(self, x:List[str], y:List[str], crop:int=800, xform:bool=True, preload:bool=False, cutoff:float=0):
-        self.x = x
-        self.y = y
+        self.x = list(x)
+        self.y = list(y)
         self.crop = crop
         self.xform = xform
         self.cutoff = cutoff
-
         self.preload = preload
-        if preload:
-            self.x = [self.load_image(p) for p in x]
-            self.y = [self.load_image(p) for p in y]
 
-    def load_image(self, path:str):
-        x = load_image(path, make_image=False, return_header=False)
-        x = x.astype(np.float32) # make sure dtype is single precision
-        mu = x.mean()
-        std = x.std()
-        x = (x - mu)/std
-        if self.cutoff > 0:
-            x[(x < -self.cutoff) | (x > self.cutoff)] = 0
-        return x
+        x_means, x_stds, shapes = zip(*_normalizations(self.x))
+        y_means, y_stds, _ = zip(*_normalizations(self.y))
+        self.shapes = np.array(shapes, dtype=np.int64)
+        self.norms = {
+            "x_mean": np.array(x_means, dtype=np.float32),
+            "x_std": np.array(x_stds, dtype=np.float32),
+            "y_mean": np.array(y_means, dtype=np.float32),
+            "y_std": np.array(y_stds, dtype=np.float32),
+        }
+        self.loader = None
+        if preload:
+            micrographs = [vio.ImageLocation(path) for path in self.x + self.y]
+            self.loader = vio.loader(scratch=vio.create_host_image_scratch(micrographs, 1))
 
     def __len__(self):
         return len(self.x)
 
+    def crops(self) -> vio.data.Dataset:
+        """The pairs cropped at new random places: a pair of patches each, sharing a
+        centre, and what normalizes each micrograph of the pair."""
+        corners = np.stack(
+            [np.random.randint(self.shapes[:, axis] - self.crop + 1) for axis in (0, 1)], axis=1
+        )
+        centres = corners + self.crop // 2
+        patch = (self.crop, self.crop)
+        return vio.data.Dataset({
+            "x": vio.data.PatchSource(self.x, centres, patch, data_type="float32", check=False),
+            "y": vio.data.PatchSource(self.y, centres, patch, data_type="float32", check=False),
+            **self.norms,
+        }, index=None)
+
+    def transform(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Normalize, cut off and randomly flip, rotate and swap a batch of crops, as
+        each pair always was, wherever the batch is."""
+        x = (batch["x"] - batch["x_mean"][:, None, None]) / batch["x_std"][:, None, None]
+        y = (batch["y"] - batch["y_mean"][:, None, None]) / batch["y_std"][:, None, None]
+        if self.cutoff > 0:
+            x[(x < -self.cutoff) | (x > self.cutoff)] = 0
+            y[(y < -self.cutoff) | (y > self.cutoff)] = 0
+        if not self.xform:
+            return x, y
+
+        n = len(x)
+        flips = [np.random.rand(n) > 0.5 for _ in range(2)]
+        turns = np.random.randint(4, size=n)
+        swaps = np.random.rand(n) > 0.5
+        for axis, flip in zip((-2, -1), flips):
+            rows = torch.from_numpy(np.flatnonzero(flip)).to(x.device)
+            x[rows], y[rows] = x[rows].flip(axis), y[rows].flip(axis)
+        for k in (1, 2, 3):
+            rows = torch.from_numpy(np.flatnonzero(turns == k)).to(x.device)
+            x[rows], y[rows] = torch.rot90(x[rows], k, (-2, -1)), torch.rot90(y[rows], k, (-2, -1))
+        swap = torch.from_numpy(swaps).to(x.device)[:, None, None]
+        return torch.where(swap, y, x), torch.where(swap, x, y)
+
     def __getitem__(self, i):
-        if self.preload:
-            x = self.x[i]
-            y = self.y[i]
-        else:
-            x = self.load_image(self.x[i])
-            y = self.load_image(self.y[i])
+        rows = self.crops().read_async([i], loader=self.loader).get()
+        x, y = self.transform({name: torch.from_numpy(values) for name, values in rows.items()})
+        return x[0].numpy(), y[0].numpy()
 
-        # randomly crop
-        if self.crop is not None:
-            size = self.crop
-
-            n,m = x.shape
-            i = np.random.randint(n-size+1)
-            j = np.random.randint(m-size+1)
-
-            x = x[i:i+size, j:j+size]
-            y = y[i:i+size, j:j+size]
-
-        # randomly flip
-        if self.xform:
-            if np.random.rand() > 0.5:
-                x = np.flip(x, 0)
-                y = np.flip(y, 0)
-            if np.random.rand() > 0.5:
-                x = np.flip(x, 1)
-                y = np.flip(y, 1)
+    def make_loader(self, batch_size:int, shuffle:bool, num_workers:int, device=None):
+        return _CroppedPasses(self, batch_size, shuffle, device)
 
 
-            k = np.random.randint(4)
-            x = np.rot90(x, k=k)
-            y = np.rot90(y, k=k)
+class _CroppedPasses:
+    """Passes over a dataset of pairs, each one cropping them at new places. The crops
+    of the next batches are read on vitrio's threads while the current one is used."""
 
-            # swap x and y
-            if np.random.rand() > 0.5:
-                t = x
-                x = y
-                y = t
+    def __init__(self, data:PairedImages, batch_size:int, shuffle:bool, device=None):
+        self.data = data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.device = device
 
-        x = np.ascontiguousarray(x)
-        y = np.ascontiguousarray(y)
+    def __len__(self):
+        return -(-len(self.data) // self.batch_size)
 
-        return x, y
-    
-    
+    def __iter__(self):
+        yield from vio.data.DataLoader(
+            self.data.crops(),
+            self.batch_size,
+            shuffle=self.shuffle,
+            loader=self.data.loader,
+            output="torch",
+            device=self.device,
+            transform=self.data.transform,
+        )
+
+
+def _normalizations(paths:List[str]) -> List[Tuple[np.float32, np.float32, Tuple[int, int]]]:
+    """The mean and standard deviation of each micrograph, as single precision values
+    of it give them, and its shape; many read at once."""
+    def normalization(path):
+        image = np.asarray(vio.read(path)).astype(np.float32, copy=False)
+        return image.mean(), image.std(), image.shape
+
+    with ThreadPoolExecutor(NORMALIZING_THREADS) as pool:
+        return list(pool.map(normalization, paths))
+
+
 class HDFPairedDataset(DenoiseDataset):
     def __init__(self, dataset:h5py.File, start:int=0, end:int=None, xform:bool=False, cutoff:float=0):
         if end is None:
