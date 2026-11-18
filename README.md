@@ -1,7 +1,11 @@
 > **A showcase of [vitrio](https://github.com/gigabit-clowns/vitrio), not a maintained fork.**
 > This is Topaz 0.3.20 with its image reading moved onto vitrio, to show what vitrio
 > changes for a program people use. It follows no later upstream release and takes
-> no issues: use upstream for anything else. What changed:
+> no issues: use upstream for anything else.
+>
+> Needs vitrio with [#58](https://github.com/gigabit-clowns/vitrio/pull/58), [#59](https://github.com/gigabit-clowns/vitrio/pull/59) and [#60](https://github.com/gigabit-clowns/vitrio/pull/60), not released yet: build vitrio from source with them.
+>
+> What changed:
 >
 > - `topaz denoise` training reads only the crops it trains on, through two `vitrio.data.PatchSource` fields, instead of two whole micrographs per crop; each micrograph is read whole once, to normalize it.
 > - `denoise`, `extract` and `preprocess` read the next micrographs through vitrio while one is processed; their outputs are byte-identical to 0.3.20's.
